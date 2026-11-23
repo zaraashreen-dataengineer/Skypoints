@@ -1,0 +1,541 @@
+-- ###################################################################
+-- SkyPoints Member Pipeline - (Snowflake SQL)
+-- 1. DDL (raw, staging, country tables)   2. Staging load: Age + Stale_Member
+-- 3. Split by country, latest record wins 4. JSON flatten + join to members
+-- 5. Validations
+-- ###################################################################
+
+-- ###################################################################
+-- DELIVERABLE 1 - CREATE TABLE QUERIES
+-- ###################################################################
+-- =====================================================================
+-- SkyPoints member pipeline  |  Snowflake
+-- Layers:  RAW (landing, all text)  ->  STG (typed + derived + DQ)  ->  TABLE_<COUNTRY> (targets)
+-- =====================================================================
+CREATE SCHEMA IF NOT EXISTS skypoints;
+USE SCHEMA skypoints;
+
+-- ---------------------------------------------------------------------
+-- 0. Reference / config tables (adding a country = 1 row + 1 table, no code change)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ref_country (
+    src_country_code  VARCHAR(5)   NOT NULL,   -- what the source sends: USA, US, AU, PHIL ...
+    country_code      VARCHAR(3)   NOT NULL,   -- our clean code (ISO alpha-3)
+    country_name      VARCHAR(100) NOT NULL,
+    target_table      VARCHAR(100) NOT NULL    -- table the member is routed to
+);
+INSERT INTO ref_country
+SELECT * FROM VALUES
+    ('USA','USA','United States','TABLE_USA'),   ('US','USA','United States','TABLE_USA'),
+    ('IND','IND','India','TABLE_INDIA'),         ('IN','IND','India','TABLE_INDIA'),
+    ('AUS','AUS','Australia','TABLE_AUSTRALIA'), ('AU','AUS','Australia','TABLE_AUSTRALIA'),
+    ('CAN','CAN','Canada','TABLE_CANADA'),
+    ('PHIL','PHL','Philippines','TABLE_PHILIPPINES'), ('PHL','PHL','Philippines','TABLE_PHILIPPINES');
+
+CREATE TABLE IF NOT EXISTS ref_tier (tier_code VARCHAR(5) PRIMARY KEY);
+INSERT INTO ref_tier VALUES ('SLV'),('GLD'),('PLT');
+
+-- ---------------------------------------------------------------------
+-- 1. RAW / LANDING  -> exactly what arrived. Everything is text so that a bad
+--    value can NEVER make the file load fail. Plus lineage columns.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS raw_member_feed (
+    record_type       VARCHAR,          -- H = header, D = detail
+    member_name       VARCHAR,
+    member_id         VARCHAR,
+    enrollment_date   VARCHAR,          -- YYYYMMDD
+    last_flight_date  VARCHAR,          -- YYYYMMDD
+    tier_code         VARCHAR,
+    agent_name        VARCHAR,
+    state             VARCHAR,
+    country           VARCHAR,
+    dob               VARCHAR,          -- DDMMYYYY (kept as text: the leading zero must survive)
+    is_active         VARCHAR,
+    post_code         VARCHAR,          -- in the spec (col 9) but absent from the sample file -> nullable
+    _file_name        VARCHAR,
+    _file_row_number  NUMBER,
+    _load_ts          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    _batch_id         VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS raw_redemption_feed (
+    v                 VARIANT,          -- one JSON document per member per day
+    _file_name        VARCHAR,
+    _file_row_number  NUMBER,
+    _load_ts          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    _batch_id         VARCHAR
+);
+
+-- ---------------------------------------------------------------------
+-- 2. STAGING -> typed, cleaned, derived columns + data-quality verdict
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS stg_member (
+    member_id         VARCHAR(18),
+    member_name       VARCHAR(255),
+    enrollment_date   DATE,
+    last_flight_date  DATE,
+    tier_code         CHAR(5),
+    agent_name        VARCHAR(255),
+    state             VARCHAR(5),
+    src_country_code  VARCHAR(5),
+    country_code      VARCHAR(3),       -- cleaned via ref_country
+    post_code         NUMBER(5,0),
+    dob               DATE,
+    is_active         CHAR(1),
+    age               NUMBER(3,0),      -- DERIVED
+    stale_member      BOOLEAN,          -- DERIVED: days since last flight > 90
+    dq_status         VARCHAR(10),      -- VALID | WARNING | REJECT
+    dq_reason         VARCHAR,          -- e.g. 'SHORT_MEMBER_ID;INVALID_TIER'
+    file_name         VARCHAR,
+    file_date         DATE,             -- parsed from the file name
+    file_row_number   NUMBER,
+    batch_id          VARCHAR,
+    load_ts           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Rejected rows are parked here (never silently dropped) so they can be fixed & replayed
+CREATE TABLE IF NOT EXISTS dq_reject_member LIKE stg_member;
+
+-- Result of every validation run (one row per check per batch)
+CREATE TABLE IF NOT EXISTS dq_results (
+    batch_id    VARCHAR,
+    check_name  VARCHAR,
+    severity    VARCHAR,
+    failed_rows NUMBER,
+    run_ts      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- ---------------------------------------------------------------------
+-- 3. TARGET: one table per country, all with the same shape (created from a template)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS member_country_template (
+    member_id         VARCHAR(18)   NOT NULL,
+    member_name       VARCHAR(255)  NOT NULL,
+    enrollment_date   DATE          NOT NULL,
+    last_flight_date  DATE,
+    tier_code         CHAR(5),
+    agent_name        VARCHAR(255),
+    state             VARCHAR(5),
+    country_code      VARCHAR(3)    NOT NULL,
+    post_code         NUMBER(5,0),
+    dob               DATE,
+    is_active         CHAR(1),
+    age               NUMBER(3,0),
+    stale_member      BOOLEAN,
+    source_file_date  DATE          NOT NULL,   -- which feed day this row came from (drives "latest wins")
+    updated_ts        TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT pk_member PRIMARY KEY (member_id)  -- informational in Snowflake; enforced by MERGE + check in 05
+)
+CLUSTER BY (member_id);
+
+CREATE TABLE IF NOT EXISTS table_india       LIKE member_country_template;
+CREATE TABLE IF NOT EXISTS table_usa         LIKE member_country_template;
+CREATE TABLE IF NOT EXISTS table_australia   LIKE member_country_template;
+CREATE TABLE IF NOT EXISTS table_canada      LIKE member_country_template;
+CREATE TABLE IF NOT EXISTS table_philippines LIKE member_country_template;
+
+-- One logical view over every country (used to join redemptions back to members)
+CREATE OR REPLACE VIEW v_member_all AS
+SELECT * FROM table_india       UNION ALL
+SELECT * FROM table_usa         UNION ALL
+SELECT * FROM table_australia   UNION ALL
+SELECT * FROM table_canada      UNION ALL
+SELECT * FROM table_philippines;
+
+-- ---------------------------------------------------------------------
+-- 4. REDEMPTIONS (flattened JSON)  - one row per transaction
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fact_redemption (
+    txn_id          VARCHAR(30)  NOT NULL,
+    member_id       VARCHAR(18)  NOT NULL,
+    txn_date        DATE,
+    partner         VARCHAR(100),
+    miles_redeemed  NUMBER(12,0),
+    status          VARCHAR(20),
+    feed_date       DATE         NOT NULL,
+    dq_status       VARCHAR(10),
+    dq_reason       VARCHAR,
+    _file_name      VARCHAR,
+    _load_ts        TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT pk_redemption PRIMARY KEY (txn_id)
+)
+CLUSTER BY (txn_date);
+
+-- ###################################################################
+-- DELIVERABLE 2 - LOAD STAGING (Age, Stale_Member) + ROW-LEVEL VALIDATIONS
+-- ###################################################################
+-- =====================================================================
+-- 
+-- Step A: COPY the flat file into RAW (text only).
+-- Step B: RAW -> STG with type conversion, derived columns and DQ verdict.
+-- Runs only for ONE batch (the new files), never the whole history -> scales to billions.
+-- =====================================================================
+USE SCHEMA skypoints;
+
+SET batch_id = TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDDHH24MISS');
+SET run_date = CURRENT_DATE();          -- "today". Pass a fixed date when replaying history.
+
+-- ---------------------------------------------------------------------
+-- Step A. Land the file.  Lines look like  |D|Elena|223457|...  so the first
+-- column ($1) is empty and the real fields start at $2.
+-- COPY INTO remembers which files it already loaded (64-day load history), so a
+-- re-run does not load the same file twice.
+-- ---------------------------------------------------------------------
+CREATE FILE FORMAT IF NOT EXISTS ff_member_pipe
+    TYPE = CSV  FIELD_DELIMITER = '|'  SKIP_HEADER = 0
+    FIELD_OPTIONALLY_ENCLOSED_BY = '"'  TRIM_SPACE = TRUE  ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE;
+
+COPY INTO raw_member_feed
+    (record_type, member_name, member_id, enrollment_date, last_flight_date, tier_code,
+     agent_name, state, country, dob, is_active,
+     _file_name, _file_row_number, _batch_id)
+FROM (
+    SELECT $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+           METADATA$FILENAME, METADATA$FILE_ROW_NUMBER, $batch_id
+    FROM @skypoints_stage/members/
+)
+FILE_FORMAT = (FORMAT_NAME = 'ff_member_pipe')
+PATTERN     = '.*MEMBER.*[0-9]{8}.*\\.txt'
+ON_ERROR    = 'CONTINUE';
+
+-- ---------------------------------------------------------------------
+-- Step B. RAW -> STG.
+-- TRY_TO_DATE returns NULL instead of failing, so one bad date cannot break the load.
+-- ---------------------------------------------------------------------
+INSERT INTO stg_member
+WITH parsed AS (
+    SELECT
+        NULLIF(TRIM(r.member_id), '')                                   AS member_id,
+        NULLIF(TRIM(r.member_name), '')                                 AS member_name,
+        TRY_TO_DATE(NULLIF(TRIM(r.enrollment_date), ''), 'YYYYMMDD')    AS enrollment_date,
+        TRY_TO_DATE(NULLIF(TRIM(r.last_flight_date), ''), 'YYYYMMDD')   AS last_flight_date,
+        UPPER(NULLIF(TRIM(r.tier_code), ''))                            AS tier_code_txt,
+        NULLIF(TRIM(r.agent_name), '')                                  AS agent_name,
+        UPPER(NULLIF(TRIM(r.state), ''))                                AS state,
+        UPPER(NULLIF(TRIM(r.country), ''))                              AS src_country_code,
+        TRY_TO_NUMBER(NULLIF(TRIM(r.post_code), ''))                    AS post_code,
+        -- DOB arrives as DDMMYYYY but the staging sample shows "3051985": the leading zero got lost
+        -- when it was treated as a number. LPAD restores it before parsing.
+        TRY_TO_DATE(LPAD(NULLIF(TRIM(r.dob), ''), 8, '0'), 'DDMMYYYY')  AS dob,
+        UPPER(NULLIF(TRIM(r.is_active), ''))                            AS is_active_txt,
+        -- keep the original text so we can tell "missing" apart from "present but invalid"
+        NULLIF(TRIM(r.enrollment_date), '')  AS enrollment_date_txt,
+        NULLIF(TRIM(r.last_flight_date), '') AS last_flight_date_txt,
+        NULLIF(TRIM(r.dob), '')              AS dob_txt,
+        r._file_name, r._file_row_number, r._batch_id,
+        TRY_TO_DATE(REGEXP_SUBSTR(r._file_name, '[0-9]{8}'), 'YYYYMMDD') AS file_date
+    FROM raw_member_feed r
+    WHERE r._batch_id = $batch_id
+      AND r.record_type = 'D'                      -- drop header rows
+),
+derived AS (
+    SELECT
+        p.*,
+        c.country_code,
+        t.tier_code                                                            AS tier_code,   -- NULL when not in ref_tier
+        IFF(p.is_active_txt IN ('A','I'), p.is_active_txt, NULL)               AS is_active,   -- NULL when not A / I
+        -- AGE: DATEDIFF('year') only counts calendar-year boundaries, so subtract 1 if the
+        -- birthday has not happened yet this year.
+        IFF(p.dob IS NULL, NULL,
+            DATEDIFF('year', p.dob, $run_date)
+            - IFF(DATEADD('year', DATEDIFF('year', p.dob, $run_date), p.dob) > $run_date, 1, 0)
+        )                                                                      AS age,
+        -- STALE_MEMBER: more than 90 days since the last flight. No flight at all => treated as stale.
+        IFF(p.last_flight_date IS NULL, TRUE,
+            DATEDIFF('day', p.last_flight_date, $run_date) > 90)               AS stale_member
+    FROM parsed p
+    LEFT JOIN ref_country c ON c.src_country_code = p.src_country_code
+    LEFT JOIN ref_tier    t ON t.tier_code        = p.tier_code_txt
+),
+checked AS (
+    SELECT
+        d.*,
+        -- ERRORS: mandatory / structural problems -> row is REJECTED
+        ARRAY_TO_STRING(ARRAY_COMPACT(ARRAY_CONSTRUCT(
+            IFF(member_id IS NULL,                                   'MISSING_MEMBER_ID', NULL),
+            IFF(LENGTH(member_id) > 18,                              'MEMBER_ID_TOO_LONG', NULL),
+            IFF(member_name IS NULL,                                 'MISSING_MEMBER_NAME', NULL),
+            IFF(LENGTH(member_name) > 255,                           'MEMBER_NAME_TOO_LONG', NULL),
+            IFF(enrollment_date_txt IS NULL,                         'MISSING_ENROLLMENT_DATE', NULL),
+            IFF(enrollment_date_txt IS NOT NULL AND enrollment_date IS NULL, 'INVALID_ENROLLMENT_DATE', NULL),
+            IFF(enrollment_date > $run_date,                         'FUTURE_ENROLLMENT_DATE', NULL),
+            IFF(country_code IS NULL,                                'UNKNOWN_COUNTRY', NULL)
+        )), ';') AS err_list,
+        -- WARNINGS: optional / suspicious values -> row is loaded, bad optional codes are nulled, issue logged
+        ARRAY_TO_STRING(ARRAY_COMPACT(ARRAY_CONSTRUCT(
+            IFF(member_id IS NOT NULL AND LENGTH(member_id) < 6,     'SHORT_MEMBER_ID', NULL),          -- 22345, 2256
+            IFF(member_id IS NOT NULL AND NOT REGEXP_LIKE(member_id, '[0-9A-Za-z_-]+'), 'BAD_MEMBER_ID_CHARS', NULL),
+            IFF(last_flight_date_txt IS NOT NULL AND last_flight_date IS NULL, 'INVALID_FLIGHT_DATE', NULL),
+            IFF(last_flight_date < enrollment_date,                  'FLIGHT_BEFORE_ENROLLMENT', NULL),
+            IFF(last_flight_date > $run_date,                        'FUTURE_FLIGHT_DATE', NULL),
+            IFF(dob_txt IS NOT NULL AND dob IS NULL,                 'INVALID_DOB', NULL),
+            IFF(age < 0 OR age > 120,                                'DOB_OUT_OF_RANGE', NULL),
+            IFF(tier_code_txt IS NOT NULL AND tier_code IS NULL,     'INVALID_TIER', NULL),         -- value nulled
+            IFF(is_active_txt IS NOT NULL AND is_active IS NULL,     'INVALID_ACTIVE_FLAG', NULL)   -- value nulled
+        )), ';') AS warn_list
+    FROM derived d
+)
+SELECT
+    member_id, member_name, enrollment_date, last_flight_date, tier_code, agent_name, state,
+    src_country_code, country_code, post_code, dob, is_active, age, stale_member,
+    CASE WHEN err_list  <> '' THEN 'REJECT'
+         WHEN warn_list <> '' THEN 'WARNING'
+         ELSE 'VALID' END                                         AS dq_status,
+    NULLIF(CONCAT_WS(';', NULLIF(err_list,''), NULLIF(warn_list,'')), '') AS dq_reason,
+    _file_name, file_date, _file_row_number, _batch_id, CURRENT_TIMESTAMP()
+FROM checked;
+
+-- Park rejects (kept for the business to fix & replay). Valid + warning rows flow on.
+INSERT INTO dq_reject_member
+SELECT * FROM stg_member WHERE batch_id = $batch_id AND dq_status = 'REJECT';
+
+-- ###################################################################
+-- DELIVERABLE 3 - SPLIT INTO COUNTRY TABLES (LATEST RECORD WINS)
+-- ###################################################################
+-- =====================================================================
+-- 
+-- Route each member to TABLE_<COUNTRY>.  Rule: LATEST RECORD WINS.
+--
+-- "Latest" = newest file_date, and inside the same file the LAST row.
+-- If a member moved India -> USA, the USA row wins and the old India row is deleted,
+-- so a member only ever exists in ONE country table.
+-- =====================================================================
+USE SCHEMA skypoints;
+
+-- 1) One row per member for this batch (the winner). Rejected rows never get here.
+CREATE OR REPLACE TEMPORARY TABLE tmp_latest AS
+SELECT *
+FROM stg_member
+WHERE batch_id = $batch_id
+  AND dq_status <> 'REJECT'
+QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY member_id
+            ORDER BY file_date DESC, file_row_number DESC) = 1;
+
+-- 1b) STALE-REPLAY GUARD: if ANY country table already holds a NEWER version of the member
+--     (e.g. an old file is re-delivered after a newer one), drop that row from the batch.
+--     Without this, the old row would be re-inserted into the country the member had already left.
+DELETE FROM tmp_latest s
+WHERE EXISTS (SELECT 1 FROM v_member_all a
+              WHERE a.member_id = s.member_id AND a.source_file_date > s.file_date);
+
+-- 2) For every country in the config table: UPSERT the winners, then remove movers.
+EXECUTE IMMEDIATE $$
+DECLARE
+    c CURSOR FOR SELECT DISTINCT country_code, target_table FROM ref_country;
+BEGIN
+    FOR rec IN c DO
+
+        -- 2a) UPSERT. "s.file_date >= t.source_file_date" protects against an OLD file
+        --     being replayed after a newer one: it can never overwrite newer data.
+        EXECUTE IMMEDIATE '
+            MERGE INTO ' || rec.target_table || ' t
+            USING (SELECT * FROM tmp_latest WHERE country_code = ''' || rec.country_code || ''') s
+               ON t.member_id = s.member_id
+            WHEN MATCHED AND s.file_date >= t.source_file_date THEN UPDATE SET
+                 member_name = s.member_name,       enrollment_date = s.enrollment_date,
+                 last_flight_date = s.last_flight_date, tier_code = s.tier_code,
+                 agent_name = s.agent_name,         state = s.state,
+                 country_code = s.country_code,     post_code = s.post_code,
+                 dob = s.dob,                       is_active = s.is_active,
+                 age = s.age,                       stale_member = s.stale_member,
+                 source_file_date = s.file_date,    updated_ts = CURRENT_TIMESTAMP()
+            WHEN NOT MATCHED THEN INSERT
+                 (member_id, member_name, enrollment_date, last_flight_date, tier_code, agent_name,
+                  state, country_code, post_code, dob, is_active, age, stale_member, source_file_date)
+                 VALUES
+                 (s.member_id, s.member_name, s.enrollment_date, s.last_flight_date, s.tier_code, s.agent_name,
+                  s.state, s.country_code, s.post_code, s.dob, s.is_active, s.age, s.stale_member, s.file_date)';
+
+        -- 2b) MOVERS: the winner says this member now lives in ANOTHER country,
+        --     so delete the stale copy from this country's table.
+        EXECUTE IMMEDIATE '
+            DELETE FROM ' || rec.target_table || ' t
+            USING tmp_latest s
+            WHERE t.member_id = s.member_id
+              AND s.country_code <> ''' || rec.country_code || '''
+              AND s.file_date >= t.source_file_date';
+
+    END FOR;
+END;
+$$;
+
+-- Why this scales: only the batch (not history) is read, MERGE touches only the matching
+-- micro-partitions thanks to CLUSTER BY (member_id), and countries are processed independently.
+
+-- ###################################################################
+-- DELIVERABLE 4 - FLATTEN JSON REDEMPTIONS + JOIN
+-- ###################################################################
+-- =====================================================================
+-- 
+-- Flatten the partner JSON feed into one row per transaction and show how to join it to members.
+-- =====================================================================
+USE SCHEMA skypoints;
+
+-- ---------------------------------------------------------------------
+-- A. Land the JSON as-is into a VARIANT column (no parsing = no failures).
+--    One JSON document per line (NDJSON) is the best format at billions of rows because
+--    Snowflake can split & load the file in parallel.
+-- ---------------------------------------------------------------------
+CREATE FILE FORMAT IF NOT EXISTS ff_redemption_json TYPE = JSON STRIP_OUTER_ARRAY = TRUE;
+
+COPY INTO raw_redemption_feed (v, _file_name, _file_row_number, _batch_id)
+FROM (SELECT $1, METADATA$FILENAME, METADATA$FILE_ROW_NUMBER, $batch_id
+      FROM @skypoints_stage/redemptions/)
+FILE_FORMAT = (FORMAT_NAME = 'ff_redemption_json')
+ON_ERROR = 'CONTINUE';
+
+-- ---------------------------------------------------------------------
+-- B. Flatten: the "redemptions" array becomes one row per element.
+--    LATERAL FLATTEN = "explode the array, keep the parent's columns next to each element".
+--    A transaction can arrive again with a new status (PENDING -> COMPLETED), so we
+--    de-duplicate on txn_id and keep the newest feed_date (same "latest wins" idea).
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE TEMPORARY TABLE tmp_redemption AS
+WITH flat AS (
+    SELECT
+        NULLIF(TRIM(r.v:member_id::STRING), '')                                AS member_id,
+        TRY_TO_DATE(r.v:feed_date::STRING, 'YYYYMMDD')                         AS feed_date,
+        NULLIF(TRIM(t.value:txn_id::STRING), '')                               AS txn_id,
+        TRY_TO_DATE(t.value:txn_date::STRING, 'YYYYMMDD')                      AS txn_date,
+        NULLIF(TRIM(t.value:partner::STRING), '')                              AS partner,
+        TRY_TO_NUMBER(t.value:miles_redeemed::STRING)                          AS miles_redeemed,
+        UPPER(NULLIF(TRIM(t.value:status::STRING), ''))                        AS status,
+        r._file_name, r._file_row_number
+    FROM raw_redemption_feed r,
+         LATERAL FLATTEN(input => r.v:redemptions) t        -- add  OUTER => TRUE  to keep members with an empty array
+    WHERE r._batch_id = $batch_id
+),
+checked AS (
+    SELECT f.*,
+        ARRAY_TO_STRING(ARRAY_COMPACT(ARRAY_CONSTRUCT(
+            IFF(member_id IS NULL,                         'MISSING_MEMBER_ID', NULL),
+            IFF(txn_id IS NULL,                            'MISSING_TXN_ID', NULL),
+            IFF(feed_date IS NULL,                         'INVALID_FEED_DATE', NULL),
+            IFF(miles_redeemed IS NULL OR miles_redeemed <= 0, 'INVALID_MILES', NULL)
+        )), ';') AS err_list,
+        ARRAY_TO_STRING(ARRAY_COMPACT(ARRAY_CONSTRUCT(
+            IFF(txn_date IS NULL,                          'INVALID_TXN_DATE', NULL),
+            IFF(txn_date > feed_date,                      'TXN_AFTER_FEED_DATE', NULL),
+            IFF(status IS NULL OR status NOT IN ('COMPLETED','PENDING','CANCELLED','REVERSED'), 'UNKNOWN_STATUS', NULL),
+            IFF(UPPER(partner) = 'SKYPOINTS',                'PARTNER_IS_OWN_PROGRAM', NULL)
+        )), ';') AS warn_list
+    FROM flat f
+)
+SELECT member_id, feed_date, txn_id, txn_date, partner, miles_redeemed, status,
+       CASE WHEN err_list <> '' THEN 'REJECT' WHEN warn_list <> '' THEN 'WARNING' ELSE 'VALID' END AS dq_status,
+       NULLIF(CONCAT_WS(';', NULLIF(err_list,''), NULLIF(warn_list,'')), '')                       AS dq_reason,
+       _file_name
+FROM checked
+QUALIFY ROW_NUMBER() OVER (PARTITION BY txn_id ORDER BY feed_date DESC, _file_row_number DESC) = 1;
+
+MERGE INTO fact_redemption t
+USING (SELECT * FROM tmp_redemption WHERE dq_status <> 'REJECT') s
+   ON t.txn_id = s.txn_id
+WHEN MATCHED AND s.feed_date >= t.feed_date THEN UPDATE SET
+     member_id = s.member_id, txn_date = s.txn_date, partner = s.partner,
+     miles_redeemed = s.miles_redeemed, status = s.status, feed_date = s.feed_date,
+     dq_status = s.dq_status, dq_reason = s.dq_reason, _file_name = s._file_name
+WHEN NOT MATCHED THEN INSERT
+     (txn_id, member_id, txn_date, partner, miles_redeemed, status, feed_date, dq_status, dq_reason, _file_name)
+     VALUES (s.txn_id, s.member_id, s.txn_date, s.partner, s.miles_redeemed, s.status, s.feed_date,
+             s.dq_status, s.dq_reason, s._file_name);
+
+-- ---------------------------------------------------------------------
+-- C. JOIN BACK to the member profile.
+--    member_id is the shared key. Members live in different country tables, so we join through
+--    the v_member_all view (UNION ALL of the country tables).
+--    LEFT JOIN: a redemption whose member is unknown is kept and shows up as an "orphan" in 05.
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_member_redemption AS
+SELECT
+    f.txn_id, f.txn_date, f.partner, f.miles_redeemed, f.status,
+    m.member_id, m.member_name, m.tier_code, m.country_code, m.age, m.stale_member
+FROM fact_redemption f
+LEFT JOIN v_member_all m ON m.member_id = f.member_id;
+
+-- Example: completed miles redeemed per country and tier
+-- SELECT country_code, tier_code, SUM(miles_redeemed) AS miles
+-- FROM v_member_redemption WHERE status = 'COMPLETED' GROUP BY 1, 2 ORDER BY miles DESC;
+--
+-- Faster alternative when v_member_all gets huge: keep a small lookup table member_country_map
+-- (member_id -> country_code), updated in 03, and join straight to ONE country table.
+
+-- ###################################################################
+-- DELIVERABLE 5 - DATA VALIDATIONS
+-- ###################################################################
+-- =====================================================================
+-- 
+-- Row-level rules (mandatory fields, formats, ranges) already run in 02 and 04 and put a
+-- verdict + reason on every row.  This file holds the BATCH-LEVEL checks and the report.
+-- Each check returns a number of failing rows -> written to dq_results.
+-- Severity: ERROR = pipeline should stop/alert, WARN = log and review.
+-- =====================================================================
+USE SCHEMA skypoints;
+
+INSERT INTO dq_results (batch_id, check_name, severity, failed_rows)
+
+-- 1. Reconciliation: nothing may disappear between RAW and STG
+SELECT $batch_id, 'RAW_VS_STG_ROWCOUNT', 'ERROR',
+       ABS((SELECT COUNT(*) FROM raw_member_feed WHERE _batch_id = $batch_id AND record_type = 'D')
+         - (SELECT COUNT(*) FROM stg_member      WHERE batch_id  = $batch_id))
+UNION ALL
+-- 2. Mandatory fields (Member Name, Member ID, Enrollment Date) -> rejected rows
+SELECT $batch_id, 'MANDATORY_FIELD_MISSING_OR_INVALID', 'ERROR',
+       COUNT(*) FROM stg_member WHERE batch_id = $batch_id AND dq_status = 'REJECT'
+UNION ALL
+-- 3. Key uniqueness INSIDE the batch: the same member twice in one run (allowed, latest wins, but visible)
+SELECT $batch_id, 'DUPLICATE_MEMBER_ID_IN_BATCH', 'WARN', COUNT(*) FROM (
+    SELECT member_id FROM stg_member
+    WHERE batch_id = $batch_id AND dq_status <> 'REJECT' GROUP BY member_id HAVING COUNT(*) > 1)
+UNION ALL
+-- 4. Same member with DIFFERENT countries in one batch (the "moved countries" case)
+SELECT $batch_id, 'MEMBER_MOVED_COUNTRY_IN_BATCH', 'WARN', COUNT(*) FROM (
+    SELECT member_id FROM stg_member
+    WHERE batch_id = $batch_id AND dq_status <> 'REJECT'
+    GROUP BY member_id HAVING COUNT(DISTINCT country_code) > 1)
+UNION ALL
+-- 5. Key uniqueness in the TARGETS: a member must exist in exactly one country table (must be 0)
+SELECT $batch_id, 'MEMBER_IN_MULTIPLE_COUNTRY_TABLES', 'ERROR', COUNT(*) FROM (
+    SELECT member_id FROM v_member_all GROUP BY member_id HAVING COUNT(*) > 1)
+UNION ALL
+-- 6. Rows landed in the wrong table (country_code in the row <> table it sits in)
+SELECT $batch_id, 'ROW_IN_WRONG_COUNTRY_TABLE', 'ERROR', COUNT(*) FROM (
+    SELECT 1 FROM table_india     WHERE country_code <> 'IND' UNION ALL
+    SELECT 1 FROM table_usa       WHERE country_code <> 'USA' UNION ALL
+    SELECT 1 FROM table_australia WHERE country_code <> 'AUS')
+UNION ALL
+-- 7. Issues visible in the sample data (each is a WARNING reason produced in 02)
+SELECT $batch_id, 'SHORT_MEMBER_ID (e.g. 22345, 2256)',      'WARN', COUNT(*) FROM stg_member WHERE batch_id = $batch_id AND CONTAINS(dq_reason, 'SHORT_MEMBER_ID')
+UNION ALL
+SELECT $batch_id, 'UNKNOWN_COUNTRY_CODE (e.g. PHIL, AU)',     'ERROR', COUNT(*) FROM stg_member WHERE batch_id = $batch_id AND CONTAINS(dq_reason, 'UNKNOWN_COUNTRY')
+UNION ALL
+SELECT $batch_id, 'INVALID_DOB (lost zero / bad date)',       'WARN', COUNT(*) FROM stg_member WHERE batch_id = $batch_id AND CONTAINS(dq_reason, 'INVALID_DOB')
+UNION ALL
+SELECT $batch_id, 'FLIGHT_BEFORE_ENROLLMENT',                 'WARN', COUNT(*) FROM stg_member WHERE batch_id = $batch_id AND CONTAINS(dq_reason, 'FLIGHT_BEFORE_ENROLLMENT')
+UNION ALL
+SELECT $batch_id, 'INVALID_TIER',                             'WARN', COUNT(*) FROM stg_member WHERE batch_id = $batch_id AND CONTAINS(dq_reason, 'INVALID_TIER')
+UNION ALL
+-- 8. Placeholder DOB: if one DOB value covers >5% of the batch it is almost certainly a default (sample: all 03051985)
+SELECT $batch_id, 'SUSPICIOUS_DEFAULT_DOB', 'WARN', COALESCE(MAX(c), 0) FROM (
+    SELECT COUNT(*) AS c FROM stg_member
+    WHERE batch_id = $batch_id AND dob IS NOT NULL GROUP BY dob
+    HAVING COUNT(*) > 0.05 * (SELECT COUNT(*) FROM stg_member WHERE batch_id = $batch_id) AND COUNT(*) > 100)
+UNION ALL
+-- 9. Redemptions: orphan transactions (member not found in any country table)
+SELECT $batch_id, 'REDEMPTION_ORPHAN_MEMBER', 'WARN', COUNT(*)
+FROM fact_redemption f LEFT JOIN v_member_all m ON m.member_id = f.member_id
+WHERE m.member_id IS NULL
+UNION ALL
+-- 10. Redemption key uniqueness (must be 0 after the MERGE)
+SELECT $batch_id, 'DUPLICATE_TXN_ID', 'ERROR', COUNT(*) FROM (
+    SELECT txn_id FROM fact_redemption GROUP BY txn_id HAVING COUNT(*) > 1);
+
+-- ---- Report for this batch ----------------------------------------------------
+SELECT check_name, severity, failed_rows
+FROM dq_results WHERE batch_id = $batch_id AND failed_rows > 0
+ORDER BY severity, failed_rows DESC;
+
+-- Which rows were rejected and why
+SELECT member_id, member_name, src_country_code, dq_reason, file_name, file_row_number
+FROM dq_reject_member WHERE batch_id = $batch_id;
